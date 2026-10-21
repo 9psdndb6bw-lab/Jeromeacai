@@ -1,4 +1,4 @@
-import os, logging
+import os, time, logging
 import httpx
 from telegram import (Update, ReplyKeyboardMarkup,
     InlineKeyboardMarkup, InlineKeyboardButton)
@@ -15,8 +15,9 @@ PORT = int(os.environ.get("PORT", 10000))
 
 BUTTON = "Acai time 🍇"
 MENU = ReplyKeyboardMarkup([[BUTTON]], resize_keyboard=True)
+EXPIRE = 60 * 60 * 24 * 30  # forget invites after 30 days
 
-# --- member list, stored in free Upstash Redis so it survives sleeping ---
+# ---------- storage (free Upstash Redis) ----------
 async def redis(*cmd):
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.post(REDIS_URL,
@@ -24,6 +25,10 @@ async def redis(*cmd):
             json=[str(x) for x in cmd])
         r.raise_for_status()
         return r.json()["result"]
+
+async def hgetall(key):
+    flat = await redis("HGETALL", key) or []
+    return dict(zip(flat[0::2], flat[1::2]))
 
 async def add_member(chat_id):
     await redis("SADD", "members", chat_id)
@@ -34,7 +39,28 @@ async def get_members():
 async def remove_member(chat_id):
     await redis("SREM", "members", chat_id)
 
-# --- bot ---
+# ---------- helpers ----------
+def display_name(user):
+    return f"@{user.username}" if user.username else (user.first_name or "Someone")
+
+def rsvp_keyboard(invite_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("I'm in 🍇", callback_data=f"rsvp:{invite_id}:yes"),
+        InlineKeyboardButton("Can't make it ❌", callback_data=f"rsvp:{invite_id}:no"),
+    ]])
+
+def render(meta, names, resp):
+    order = {"yes": 0, "no": 1, "waiting": 2}
+    icons = {"yes": "✅", "no": "❌", "waiting": "⏳"}
+    words = {"yes": "accepted", "no": "declined", "waiting": "waiting for answer"}
+    rows = sorted(
+        ((resp.get(cid, "waiting"), name) for cid, name in names.items()),
+        key=lambda x: (order[x[0]], x[1].lower()))
+    lines = [f"{icons[s]} {n}: {words[s]}" for s, n in rows]
+    return (f"{meta['inviter']} says: Acai time? ({meta['date']}) 🍇\n\n"
+            + "\n".join(lines))
+
+# ---------- bot flow ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await add_member(update.effective_chat.id)
     await update.message.reply_text(
@@ -66,24 +92,80 @@ async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Cancelled.")
         return
 
-    user = q.from_user
-    name = f"@{user.username}" if user.username else user.first_name
-    msg = f"{name} says: Acai time? ({date}) 🍇"
+    sender_id = q.from_user.id
+    inviter = display_name(q.from_user)
+    invite_id = str(int(time.time()))
 
-    sent = 0
-    for chat_id in await get_members():
+    # work out everyone's name
+    names = {}
+    members = await get_members()
+    for chat_id in members:
         try:
-            await ctx.bot.send_message(chat_id, msg)
-            sent += 1
+            chat = await ctx.bot.get_chat(chat_id)
+            names[str(chat_id)] = (f"@{chat.username}" if chat.username
+                                   else (chat.first_name or "Someone"))
         except Exception:
-            await remove_member(chat_id)  # blocked the bot
-    await q.edit_message_text(f"Invite sent to {sent} people 🍇")
+            await remove_member(chat_id)
+    names[str(sender_id)] = inviter
 
+    # the person who started the invite is already in
+    resp = {str(sender_id): "yes"}
+    meta = {"date": date, "inviter": inviter}
+    text = render(meta, names, resp)
+
+    msgs = {}
+    for chat_id in [int(c) for c in names]:
+        try:
+            m = await ctx.bot.send_message(
+                chat_id, text, reply_markup=rsvp_keyboard(invite_id))
+            msgs[str(chat_id)] = m.message_id
+        except Exception:
+            await remove_member(chat_id)
+
+    # save the invite
+    p = f"invite:{invite_id}"
+    await redis("HSET", f"{p}:meta", "date", date, "inviter", inviter)
+    for field, data in ((":names", names), (":resp", resp), (":msgs", msgs)):
+        for k, v in data.items():
+            await redis("HSET", p + field, k, v)
+    for field in (":meta", ":names", ":resp", ":msgs"):
+        await redis("EXPIRE", p + field, EXPIRE)
+
+    await q.edit_message_text(f"Invite sent to {len(msgs)} people 🍇")
+
+async def rsvp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, invite_id, answer = q.data.split(":")
+    p = f"invite:{invite_id}"
+
+    meta = await hgetall(f"{p}:meta")
+    if not meta:
+        await q.answer("This invite has expired.")
+        return
+
+    await redis("HSET", f"{p}:resp", q.from_user.id, answer)
+    await q.answer("Got it! 🍇" if answer == "yes" else "Noted")
+
+    names = await hgetall(f"{p}:names")
+    resp = await hgetall(f"{p}:resp")
+    msgs = await hgetall(f"{p}:msgs")
+    text = render(meta, names, resp)
+
+    for chat_id, message_id in msgs.items():
+        try:
+            await ctx.bot.edit_message_text(
+                text, chat_id=int(chat_id), message_id=int(message_id),
+                reply_markup=rsvp_keyboard(invite_id))
+        except Exception:
+            pass  # e.g. message unchanged or chat gone
+
+# ---------- wiring ----------
 app = Application.builder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.Text([BUTTON]), button_pressed))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, got_date))
-app.add_handler(CallbackQueryHandler(confirm))
+app.add_handler(CallbackQueryHandler(rsvp, pattern=r"^rsvp:"))
+app.add_handler(CallbackQueryHandler(confirm, pattern=r"^(yes|no)$"))
 
 print("Acai bot starting (webhook mode)...", flush=True)
 app.run_webhook(
