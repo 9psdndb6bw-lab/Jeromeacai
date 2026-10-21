@@ -3,7 +3,7 @@ import httpx
 from telegram import (Update, ReplyKeyboardMarkup,
     InlineKeyboardMarkup, InlineKeyboardButton)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters)
+    CallbackQueryHandler, ChatMemberHandler, ContextTypes, filters)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -78,16 +78,20 @@ def render(meta, names, resp):
 
 # ---------- bot flow ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await add_member(update.effective_chat.id)
+    await update.message.reply_text(
+        "You're in the acai crew 🍇", reply_markup=MENU)
+
+async def group_membership(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs when the bot is added to / removed from a group."""
     chat = update.effective_chat
-    if chat.type == "private":
-        await add_member(chat.id)
-        await update.message.reply_text(
-            "You're in the acai crew 🍇", reply_markup=MENU)
-    else:
+    if chat.type not in ("group", "supergroup"):
+        return
+    status = update.my_chat_member.new_chat_member.status
+    if status in ("member", "administrator"):
         await add_group(chat.id)
-        await update.message.reply_text(
-            "This group will now see acai invites and who's in 🍇\n"
-            "To join the crew yourself, message me privately and tap Start.")
+    else:  # left or kicked
+        await remove_group(chat.id)
 
 async def members_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     people, groups = await split_chats()
@@ -218,8 +222,9 @@ async def rsvp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- wiring ----------
 app = Application.builder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("members", members_cmd))
+app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+app.add_handler(CommandHandler("members", members_cmd, filters=filters.ChatType.PRIVATE))
+app.add_handler(ChatMemberHandler(group_membership, ChatMemberHandler.MY_CHAT_MEMBER))
 app.add_handler(MessageHandler(
     filters.ChatType.PRIVATE & filters.Text([BUTTON]), button_pressed))
 app.add_handler(MessageHandler(
@@ -233,4 +238,5 @@ app.run_webhook(
     port=PORT,
     url_path=TOKEN,
     webhook_url=f"{BASE_URL}/{TOKEN}",
+    allowed_updates=Update.ALL_TYPES,
 )
