@@ -1,6 +1,7 @@
 import os, time, logging
 import httpx
-from telegram import (Update, ReplyKeyboardMarkup,
+from telegram import (BotCommand, BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats, Update, ReplyKeyboardMarkup,
     InlineKeyboardMarkup, InlineKeyboardButton)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ChatMemberHandler, ContextTypes, filters)
@@ -14,7 +15,8 @@ BASE_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
 PORT = int(os.environ.get("PORT", 10000))
 
 BUTTON = "Acai time 🍇"
-MENU = ReplyKeyboardMarkup([[BUTTON]], resize_keyboard=True)
+MEMBERS_BUTTON = "Members 👥"
+MENU = ReplyKeyboardMarkup([[BUTTON, MEMBERS_BUTTON]], resize_keyboard=True)
 EXPIRE = 60 * 60 * 24 * 30  # forget invites after 30 days
 
 # ---------- storage (free Upstash Redis) ----------
@@ -102,18 +104,19 @@ async def members_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await remove_member(chat_id)
     if not names:
-        await update.message.reply_text("Nobody's in the crew yet.")
+        await update.message.reply_text("Nobody's in the crew yet.", reply_markup=MENU)
         return
     names.sort(key=str.lower)
     text = f"Acai crew ({len(names)}) 🍇\n" + "\n".join(f"• {n}" for n in names)
     if groups:
         text += f"\n\n+ {len(groups)} group(s) following along"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=MENU)
 
 async def button_pressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await add_member(update.effective_chat.id)
     ctx.user_data["awaiting_date"] = True
-    await update.message.reply_text("What date? (e.g. Thursday 22 Oct)")
+    await update.message.reply_text(
+        "What date? (e.g. Thursday 22 Oct)", reply_markup=MENU)
 
 async def got_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.user_data.get("awaiting_date"):
@@ -221,12 +224,22 @@ async def rsvp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass  # e.g. message unchanged or chat gone
 
 # ---------- wiring ----------
-app = Application.builder().token(TOKEN).build()
+async def setup(application):
+    # Command shortcuts only in private chats, none in groups
+    await application.bot.delete_my_commands()  # default list (e.g. from BotFather)
+    await application.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
+    await application.bot.set_my_commands(
+        [BotCommand("members", "See who's in the crew")],
+        scope=BotCommandScopeAllPrivateChats())
+
+app = Application.builder().token(TOKEN).post_init(setup).build()
 app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
 app.add_handler(CommandHandler("members", members_cmd, filters=filters.ChatType.PRIVATE))
 app.add_handler(ChatMemberHandler(group_membership, ChatMemberHandler.MY_CHAT_MEMBER))
 app.add_handler(MessageHandler(
     filters.ChatType.PRIVATE & filters.Text([BUTTON]), button_pressed))
+app.add_handler(MessageHandler(
+    filters.ChatType.PRIVATE & filters.Text([MEMBERS_BUTTON]), members_cmd))
 app.add_handler(MessageHandler(
     filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, got_date))
 app.add_handler(CallbackQueryHandler(rsvp, pattern=r"^rsvp:"))
