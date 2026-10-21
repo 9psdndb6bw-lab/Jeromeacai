@@ -33,11 +33,27 @@ async def hgetall(key):
 async def add_member(chat_id):
     await redis("SADD", "members", chat_id)
 
-async def get_members():
-    return [int(x) for x in await redis("SMEMBERS", "members")]
-
 async def remove_member(chat_id):
     await redis("SREM", "members", chat_id)
+
+async def add_group(chat_id):
+    await redis("SADD", "groups", chat_id)
+
+async def remove_group(chat_id):
+    await redis("SREM", "groups", chat_id)
+    await redis("SREM", "members", chat_id)  # clean up older versions
+
+async def split_chats():
+    """People = private chats. Groups = group chats (negative ids)."""
+    ids = [int(x) for x in await redis("SMEMBERS", "members")]
+    gids = [int(x) for x in await redis("SMEMBERS", "groups")]
+    people = [i for i in ids if i > 0]
+    groups = list(set(gids) | {i for i in ids if i < 0})
+    return people, groups
+
+async def chat_name(bot, chat_id):
+    chat = await bot.get_chat(chat_id)
+    return f"@{chat.username}" if chat.username else (chat.first_name or "Someone")
 
 # ---------- helpers ----------
 def display_name(user):
@@ -62,9 +78,33 @@ def render(meta, names, resp):
 
 # ---------- bot flow ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await add_member(update.effective_chat.id)
-    await update.message.reply_text(
-        "You're in the acai crew 🍇", reply_markup=MENU)
+    chat = update.effective_chat
+    if chat.type == "private":
+        await add_member(chat.id)
+        await update.message.reply_text(
+            "You're in the acai crew 🍇", reply_markup=MENU)
+    else:
+        await add_group(chat.id)
+        await update.message.reply_text(
+            "This group will now see acai invites and who's in 🍇\n"
+            "To join the crew yourself, message me privately and tap Start.")
+
+async def members_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    people, groups = await split_chats()
+    names = []
+    for chat_id in people:
+        try:
+            names.append(await chat_name(ctx.bot, chat_id))
+        except Exception:
+            await remove_member(chat_id)
+    if not names:
+        await update.message.reply_text("Nobody's in the crew yet.")
+        return
+    names.sort(key=str.lower)
+    text = f"Acai crew ({len(names)}) 🍇\n" + "\n".join(f"• {n}" for n in names)
+    if groups:
+        text += f"\n\n+ {len(groups)} group(s) following along"
+    await update.message.reply_text(text)
 
 async def button_pressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await add_member(update.effective_chat.id)
@@ -98,12 +138,10 @@ async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # work out everyone's name
     names = {}
-    members = await get_members()
-    for chat_id in members:
+    people, groups = await split_chats()
+    for chat_id in people:
         try:
-            chat = await ctx.bot.get_chat(chat_id)
-            names[str(chat_id)] = (f"@{chat.username}" if chat.username
-                                   else (chat.first_name or "Someone"))
+            names[str(chat_id)] = await chat_name(ctx.bot, chat_id)
         except Exception:
             await remove_member(chat_id)
     names[str(sender_id)] = inviter
@@ -122,16 +160,27 @@ async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await remove_member(chat_id)
 
+    # groups: show the same list, but they don't count as members
+    gmsgs = {}
+    for chat_id in groups:
+        try:
+            m = await ctx.bot.send_message(chat_id, text)
+            gmsgs[str(chat_id)] = m.message_id
+        except Exception:
+            await remove_group(chat_id)
+
     # save the invite
     p = f"invite:{invite_id}"
     await redis("HSET", f"{p}:meta", "date", date, "inviter", inviter)
-    for field, data in ((":names", names), (":resp", resp), (":msgs", msgs)):
+    for field, data in ((":names", names), (":resp", resp),
+                        (":msgs", msgs), (":gmsgs", gmsgs)):
         for k, v in data.items():
             await redis("HSET", p + field, k, v)
-    for field in (":meta", ":names", ":resp", ":msgs"):
+    for field in (":meta", ":names", ":resp", ":msgs", ":gmsgs"):
         await redis("EXPIRE", p + field, EXPIRE)
 
-    await q.edit_message_text(f"Invite sent to {len(msgs)} people 🍇")
+    extra = f" + {len(gmsgs)} group(s)" if gmsgs else ""
+    await q.edit_message_text(f"Invite sent to {len(msgs)} people{extra} 🍇")
 
 async def rsvp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -149,7 +198,15 @@ async def rsvp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     names = await hgetall(f"{p}:names")
     resp = await hgetall(f"{p}:resp")
     msgs = await hgetall(f"{p}:msgs")
+    gmsgs = await hgetall(f"{p}:gmsgs")
     text = render(meta, names, resp)
+
+    for chat_id, message_id in gmsgs.items():
+        try:
+            await ctx.bot.edit_message_text(
+                text, chat_id=int(chat_id), message_id=int(message_id))
+        except Exception:
+            pass
 
     for chat_id, message_id in msgs.items():
         try:
@@ -162,8 +219,11 @@ async def rsvp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- wiring ----------
 app = Application.builder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.Text([BUTTON]), button_pressed))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, got_date))
+app.add_handler(CommandHandler("members", members_cmd))
+app.add_handler(MessageHandler(
+    filters.ChatType.PRIVATE & filters.Text([BUTTON]), button_pressed))
+app.add_handler(MessageHandler(
+    filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, got_date))
 app.add_handler(CallbackQueryHandler(rsvp, pattern=r"^rsvp:"))
 app.add_handler(CallbackQueryHandler(confirm, pattern=r"^(yes|no)$"))
 
